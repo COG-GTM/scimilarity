@@ -28,7 +28,7 @@ class CellEmbedding:
         import json
         import os
         import pandas as pd
-        from .nn_models import Encoder
+        from .nn_models import Encoder, TransformerMoEEncoder
 
         self.model_path = model_path
         self.use_gpu = use_gpu
@@ -42,27 +42,53 @@ class CellEmbedding:
         with open(self.filenames["gene_order"], "r") as fh:
             self.gene_order = [line.strip() for line in fh]
 
-        # get neural network model and infer network size
-        with open(os.path.join(self.model_path, "layer_sizes.json"), "r") as fh:
-            layer_sizes = json.load(fh)
-        # keys: network.1.weight, network.2.weight, ..., network.n.weight
-        layers = [
-            (key, layer_sizes[key])
-            for key in sorted(list(layer_sizes.keys()))
-            if "weight" in key and len(layer_sizes[key]) > 1
-        ]
-        parameters = {
-            "latent_dim": layers[-1][1][0],  # last
-            "hidden_dim": [layer[1][0] for layer in layers][0:-1],  # all but last
-        }
+        # detect architecture
+        model_config_path = os.path.join(self.model_path, "model_config.json")
+        if os.path.exists(model_config_path):
+            with open(model_config_path, "r") as fh:
+                model_config = json.load(fh)
+            self.architecture = model_config.get("architecture", "mlp")
+        else:
+            self.architecture = "mlp"
 
         self.n_genes = len(self.gene_order)
-        self.latent_dim = parameters["latent_dim"]
-        self.model = Encoder(
-            n_genes=self.n_genes,
-            latent_dim=parameters["latent_dim"],
-            hidden_dim=parameters["hidden_dim"],
-        )
+
+        if self.architecture == "transformer_moe":
+            self.latent_dim = model_config.get("latent_dim", 128)
+            self.model = TransformerMoEEncoder(
+                n_genes=self.n_genes,
+                latent_dim=self.latent_dim,
+                d_model=model_config.get("d_model", 256),
+                n_heads=model_config.get("n_heads", 8),
+                n_layers=model_config.get("n_layers", 4),
+                d_ff=model_config.get("d_ff", 512),
+                num_experts=model_config.get("num_experts", 8),
+                top_k=model_config.get("top_k", 2),
+                patch_size=model_config.get("patch_size", 160),
+                input_dropout=0.0,
+                dropout=0.0,
+            )
+        else:
+            # get neural network model and infer network size
+            with open(os.path.join(self.model_path, "layer_sizes.json"), "r") as fh:
+                layer_sizes = json.load(fh)
+            # keys: network.1.weight, network.2.weight, ..., network.n.weight
+            layers = [
+                (key, layer_sizes[key])
+                for key in sorted(list(layer_sizes.keys()))
+                if "weight" in key and len(layer_sizes[key]) > 1
+            ]
+            parameters = {
+                "latent_dim": layers[-1][1][0],  # last
+                "hidden_dim": [layer[1][0] for layer in layers][0:-1],  # all but last
+            }
+            self.latent_dim = parameters["latent_dim"]
+            self.model = Encoder(
+                n_genes=self.n_genes,
+                latent_dim=parameters["latent_dim"],
+                hidden_dim=parameters["hidden_dim"],
+            )
+
         if self.use_gpu is True:
             self.model.cuda()
         self.model.load_state(self.filenames["model"])
@@ -142,7 +168,10 @@ class CellEmbedding:
 
                 if self.use_gpu is True:
                     profiles = profiles.cuda()
-                embedding_parts.append(self.model(profiles))
+                output = self.model(profiles)
+                if isinstance(output, tuple):
+                    output = output[0]  # discard aux_loss during inference
+                embedding_parts.append(output)
 
         if not embedding_parts:
             raise RuntimeError("No valid cells detected.")

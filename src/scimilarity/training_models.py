@@ -9,7 +9,7 @@ from torch import nn
 from typing import Optional, List
 
 from .triplet_selector import TripletLoss
-from .nn_models import Encoder, Decoder
+from .nn_models import Encoder, Decoder, TransformerMoEEncoder, TransformerMoEDecoder
 
 
 class MetricLearning(pl.LightningModule):
@@ -90,6 +90,15 @@ class MetricLearning(pl.LightningModule):
         cosine_annealing_tmax: Optional[int] = None,
         track_triplets: Optional[str] = None,
         track_triplets_above_step: int = -1,
+        architecture: str = "transformer_moe",
+        d_model: int = 256,
+        n_heads: int = 8,
+        n_layers: int = 4,
+        d_ff: int = 512,
+        num_experts: int = 8,
+        top_k: int = 2,
+        patch_size: int = 160,
+        moe_aux_loss_weight: float = 0.01,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -115,20 +124,58 @@ class MetricLearning(pl.LightningModule):
         ):
             self.cosine_annealing_tmax = max_epochs
 
+        # architecture selection
+        self.architecture = architecture
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.d_ff = d_ff
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.patch_size = patch_size
+        self.moe_aux_loss_weight = moe_aux_loss_weight
+
         # networks
-        self.encoder = Encoder(
-            self.n_genes,
-            latent_dim=self.latent_dim,
-            hidden_dim=self.hidden_dim,
-            dropout=self.dropout,
-            input_dropout=self.input_dropout,
-        )
-        self.decoder = Decoder(
-            self.n_genes,
-            latent_dim=self.latent_dim,
-            hidden_dim=list(reversed(self.hidden_dim)),
-            dropout=self.dropout,
-        )
+        if self.architecture == "transformer_moe":
+            self.encoder = TransformerMoEEncoder(
+                self.n_genes,
+                latent_dim=self.latent_dim,
+                d_model=self.d_model,
+                n_heads=self.n_heads,
+                n_layers=self.n_layers,
+                d_ff=self.d_ff,
+                num_experts=self.num_experts,
+                top_k=self.top_k,
+                patch_size=self.patch_size,
+                input_dropout=self.input_dropout,
+                dropout=self.dropout,
+            )
+            self.decoder = TransformerMoEDecoder(
+                self.n_genes,
+                latent_dim=self.latent_dim,
+                d_model=self.d_model,
+                n_heads=self.n_heads,
+                n_layers=self.n_layers,
+                d_ff=self.d_ff,
+                num_experts=self.num_experts,
+                top_k=self.top_k,
+                patch_size=self.patch_size,
+                dropout=self.dropout,
+            )
+        else:
+            self.encoder = Encoder(
+                self.n_genes,
+                latent_dim=self.latent_dim,
+                hidden_dim=self.hidden_dim,
+                dropout=self.dropout,
+                input_dropout=self.input_dropout,
+            )
+            self.decoder = Decoder(
+                self.n_genes,
+                latent_dim=self.latent_dim,
+                hidden_dim=list(reversed(self.hidden_dim)),
+                dropout=self.dropout,
+            )
 
         # save layer sizes
         model_state_dict = self.encoder.state_dict()
@@ -198,11 +245,18 @@ class MetricLearning(pl.LightningModule):
             Output tensor corresponding to the last encoder layer.
         x_hat: torch.Tensor
             Output tensor corresponding to the last decoder layer.
+        moe_aux_loss: torch.Tensor
+            Auxiliary MoE load-balancing loss (0 for MLP architecture).
         """
 
-        z = self.encoder(x)
-        x_hat = self.decoder(z)
-        return z, x_hat
+        if self.architecture == "transformer_moe":
+            z, enc_aux_loss = self.encoder(x)
+            x_hat, dec_aux_loss = self.decoder(z)
+            return z, x_hat, enc_aux_loss + dec_aux_loss
+        else:
+            z = self.encoder(x)
+            x_hat = self.decoder(z)
+            return z, x_hat, torch.tensor(0.0, device=x.device)
 
     def get_losses(self, batch, use_studies: bool = True, val_metrics: bool = False):
         """Calculate the triplet and reconstruction loss.
@@ -235,7 +289,7 @@ class MetricLearning(pl.LightningModule):
         if "sparse" in dir(self.trainer.datamodule) and self.trainer.datamodule.sparse:
             cells = cells.to_dense()
 
-        embedding, reconstruction = self(cells)
+        embedding, reconstruction, moe_aux_loss = self(cells)
 
         triplet_loss, num_hard_triplets, num_viable_triplets, triplets_idx = (
             self.triplet_loss_fn(
@@ -255,6 +309,7 @@ class MetricLearning(pl.LightningModule):
                 num_viable_triplets,
                 asw,
                 nmse,
+                moe_aux_loss,
             )
         else:
             if (
@@ -288,9 +343,10 @@ class MetricLearning(pl.LightningModule):
                 mse,
                 num_hard_triplets,
                 num_viable_triplets,
+                moe_aux_loss,
             )
 
-    def get_mixed_loss(self, triplet_loss, mse):
+    def get_mixed_loss(self, triplet_loss, mse, moe_aux_loss=None):
         """Calculate the mixed loss.
 
         Parameters
@@ -307,12 +363,16 @@ class MetricLearning(pl.LightningModule):
         """
 
         if self.triplet_loss_weight == 0:
-            return mse
-        if self.triplet_loss_weight == 1:
-            return triplet_loss
-        return (self.triplet_loss_weight * triplet_loss) + (
-            (1.0 - self.triplet_loss_weight) * mse
-        )
+            base = mse
+        elif self.triplet_loss_weight == 1:
+            base = triplet_loss
+        else:
+            base = (self.triplet_loss_weight * triplet_loss) + (
+                (1.0 - self.triplet_loss_weight) * mse
+            )
+        if moe_aux_loss is not None and self.architecture == "transformer_moe":
+            base = base + self.moe_aux_loss_weight * moe_aux_loss
+        return base
 
     def training_step(self, batch, batch_idx):
         """Pytorch-lightning training step.
@@ -330,26 +390,37 @@ class MetricLearning(pl.LightningModule):
             mse,
             num_hard_triplets,
             num_viable_triplets,
+            moe_aux_loss,
         ) = self.get_losses(batch, val_metrics=False)
 
         triplet_loss = triplet_losses.mean()
         num_nonzero_loss = (triplet_losses > 0).sum(dtype=torch.float).detach()
         hard_triplets = num_hard_triplets / num_viable_triplets
 
-        loss = self.get_mixed_loss(triplet_loss, mse)
+        loss = self.get_mixed_loss(triplet_loss, mse, moe_aux_loss)
 
         current_lr = self.scheduler["scheduler"].get_last_lr()[0]
 
         if self.l1 > 0:  # use l1 penalty for first layer
-            for layer in self.encoder.network:
-                if isinstance(layer, nn.Linear):
-                    l1_norm = sum(p.abs().sum() for p in layer.parameters())
-                    l1_penalty = self.l1 * l1_norm * current_lr
-                    loss += l1_penalty
-                    self.log(
-                        "train l1 penalty", l1_penalty, prog_bar=False, logger=True
-                    )
-                    break
+            if self.architecture == "transformer_moe":
+                l1_norm = sum(
+                    p.abs().sum() for p in self.encoder.patch_embedding.parameters()
+                )
+                l1_penalty = self.l1 * l1_norm * current_lr
+                loss += l1_penalty
+                self.log(
+                    "train l1 penalty", l1_penalty, prog_bar=False, logger=True
+                )
+            else:
+                for layer in self.encoder.network:
+                    if isinstance(layer, nn.Linear):
+                        l1_norm = sum(p.abs().sum() for p in layer.parameters())
+                        l1_penalty = self.l1 * l1_norm * current_lr
+                        loss += l1_penalty
+                        self.log(
+                            "train l1 penalty", l1_penalty, prog_bar=False, logger=True
+                        )
+                        break
 
         # if self.l2 > 0:  # use l2 penalty
         #    l2_regularization = []
@@ -370,6 +441,7 @@ class MetricLearning(pl.LightningModule):
         self.log("train loss", loss, prog_bar=False, logger=True)
         self.log("train triplet loss", triplet_loss, prog_bar=True, logger=True)
         self.log("train mse", mse, prog_bar=True, logger=True)
+        self.log("train moe_aux_loss", moe_aux_loss, prog_bar=False, logger=True)
         self.log("train hard triplets", hard_triplets, prog_bar=True, logger=True)
         self.log(
             "train num nonzero loss", num_nonzero_loss, prog_bar=False, logger=True
@@ -470,6 +542,7 @@ class MetricLearning(pl.LightningModule):
             num_viable_triplets,
             asw,
             nmse,
+            moe_aux_loss,
         ) = self.get_losses(batch, use_studies=False, val_metrics=True)
 
         triplet_loss = triplet_losses.mean()
@@ -477,7 +550,7 @@ class MetricLearning(pl.LightningModule):
         hard_triplets = num_hard_triplets / num_viable_triplets
         evaluation_metric = (1 - asw) / 2 + nmse
 
-        loss = self.get_mixed_loss(triplet_loss, mse)
+        loss = self.get_mixed_loss(triplet_loss, mse, moe_aux_loss)
 
         losses = {
             f"{prefix}_loss": loss,
@@ -490,6 +563,7 @@ class MetricLearning(pl.LightningModule):
             f"{prefix}_asw": asw,
             f"{prefix}_nmse": nmse,
             f"{prefix}_evaluation_metric": evaluation_metric,
+            f"{prefix}_moe_aux_loss": moe_aux_loss,
         }
 
         if prefix == "val":
@@ -539,6 +613,9 @@ class MetricLearning(pl.LightningModule):
         evaluation_metric = torch.Tensor(
             [step[f"{prefix}_evaluation_metric"] for step in step_outputs]
         ).mean()
+        moe_aux_loss = torch.Tensor(
+            [step[f"{prefix}_moe_aux_loss"] for step in step_outputs]
+        ).mean()
 
         self.log(f"{prefix} loss", loss, logger=True)
         self.log(f"{prefix} triplet loss", triplet_loss, logger=True)
@@ -550,6 +627,7 @@ class MetricLearning(pl.LightningModule):
         self.log(f"{prefix} asw", asw, logger=True)
         self.log(f"{prefix} nmse", nmse, logger=True)
         self.log(f"{prefix} evaluation_metric", evaluation_metric, logger=True)
+        self.log(f"{prefix} moe_aux_loss", moe_aux_loss, logger=True)
 
         losses = {
             f"{prefix}_loss": loss,
@@ -562,6 +640,7 @@ class MetricLearning(pl.LightningModule):
             f"{prefix}_asw": asw,
             f"{prefix}_nmse": nmse,
             f"{prefix}_evaluation_metric": evaluation_metric,
+            f"{prefix}_moe_aux_loss": moe_aux_loss,
         }
         return losses
 
@@ -580,6 +659,22 @@ class MetricLearning(pl.LightningModule):
         with open(os.path.join(model_path, "layer_sizes.json"), "w") as f:
             f.write(json.dumps(self.layer_sizes))
 
+        # save model config for architecture detection at inference time
+        model_config = {
+            "architecture": self.architecture,
+            "n_genes": self.n_genes,
+            "latent_dim": self.latent_dim,
+            "d_model": self.d_model,
+            "n_heads": self.n_heads,
+            "n_layers": self.n_layers,
+            "d_ff": self.d_ff,
+            "num_experts": self.num_experts,
+            "top_k": self.top_k,
+            "patch_size": self.patch_size,
+        }
+        with open(os.path.join(model_path, "model_config.json"), "w") as f:
+            f.write(json.dumps(model_config))
+
         # save hyperparameters as json
         hyperparameters = {
             "latent_dim": self.latent_dim,
@@ -597,6 +692,15 @@ class MetricLearning(pl.LightningModule):
             "l2_lambda": self.l2,
             "batch_size": self.trainer.datamodule.batch_size,
             "max_epochs": self.max_epochs,
+            "architecture": self.architecture,
+            "d_model": self.d_model,
+            "n_heads": self.n_heads,
+            "n_layers": self.n_layers,
+            "d_ff": self.d_ff,
+            "num_experts": self.num_experts,
+            "top_k": self.top_k,
+            "patch_size": self.patch_size,
+            "moe_aux_loss_weight": self.moe_aux_loss_weight,
         }
         with open(os.path.join(model_path, "hyperparameters.json"), "w") as f:
             f.write(json.dumps(hyperparameters))
@@ -664,25 +768,32 @@ class MetricLearning(pl.LightningModule):
         self.decoder.load_state(decoder_filename, use_gpu)
 
         if freeze:
-            # encoder batchnorm freeze
-            for i in range(len(self.encoder.network)):
-                if isinstance(self.encoder.network[i], nn.BatchNorm1d):
-                    for param in self.encoder.network[i].parameters():
-                        param.requires_grad = False  # freeze
+            if self.architecture == "mlp":
+                # encoder batchnorm freeze
+                for i in range(len(self.encoder.network)):
+                    if isinstance(self.encoder.network[i], nn.BatchNorm1d):
+                        for param in self.encoder.network[i].parameters():
+                            param.requires_grad = False  # freeze
 
-            # encoder linear freeze
-            encoder_linear_idx = []
-            for i in range(len(self.encoder.network)):
-                if isinstance(self.encoder.network[i], nn.Linear):
-                    encoder_linear_idx.append(i)
-            for i in range(len(encoder_linear_idx)):
-                if i < len(encoder_linear_idx) - 1:  # freeze all but bottleneck
-                    for param in self.encoder.network[
-                        encoder_linear_idx[i]
-                    ].parameters():
-                        param.requires_grad = False  # freeze
-                else:
-                    for param in self.encoder.network[
-                        encoder_linear_idx[i]
-                    ].parameters():
-                        param.requires_grad = True  # unfreeze
+                # encoder linear freeze
+                encoder_linear_idx = []
+                for i in range(len(self.encoder.network)):
+                    if isinstance(self.encoder.network[i], nn.Linear):
+                        encoder_linear_idx.append(i)
+                for i in range(len(encoder_linear_idx)):
+                    if i < len(encoder_linear_idx) - 1:  # freeze all but bottleneck
+                        for param in self.encoder.network[
+                            encoder_linear_idx[i]
+                        ].parameters():
+                            param.requires_grad = False  # freeze
+                    else:
+                        for param in self.encoder.network[
+                            encoder_linear_idx[i]
+                        ].parameters():
+                            param.requires_grad = True  # unfreeze
+            else:
+                # transformer_moe: freeze all except the projection head
+                for param in self.encoder.parameters():
+                    param.requires_grad = False
+                for param in self.encoder.projection.parameters():
+                    param.requires_grad = True
