@@ -1,11 +1,12 @@
 import anndata
 import argparse
-import hnswlib
 import os, sys
 import numpy as np
 import pandas as pd
 import tiledb
 from tqdm import tqdm
+
+from scimilarity.knn_backends import KNN_BACKENDS
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -84,17 +85,18 @@ def main():
             f.write(f"{labels[i]}\t{studies[i]}\n")
 
     # build knn
-    n_cells, n_dims = embeddings.shape
-    knn = hnswlib.Index(space="cosine", dim=n_dims)
-    knn.init_index(max_elements=n_cells, ef_construction=ef_construction, M=M)
-    knn.set_ef(ef_construction)
-    knn.add_items(embeddings, range(len(embeddings)))
+    backend = KNN_BACKENDS["hnswlib"]()
+    backend.build(
+        embeddings,
+        ef_construction=ef_construction,
+        M=M,
+    )
 
     # save knn
     knn_fullpath = os.path.join(annotation_path, knn_filename)
     if os.path.isfile(knn_fullpath):  # backup existing
         os.rename(knn_fullpath, knn_fullpath + ".bak")
-    knn.save_index(knn_fullpath)
+    backend.save(knn_fullpath)
 
 
 if __name__ == "__main__":
