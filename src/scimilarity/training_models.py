@@ -402,7 +402,16 @@ class MetricLearning(pl.LightningModule):
         current_lr = self.scheduler["scheduler"].get_last_lr()[0]
 
         if self.l1 > 0:  # use l1 penalty for first layer
-            if self.architecture == "mlp":
+            if self.architecture == "transformer_moe":
+                l1_norm = sum(
+                    p.abs().sum() for p in self.encoder.patch_embedding.parameters()
+                )
+                l1_penalty = self.l1 * l1_norm * current_lr
+                loss += l1_penalty
+                self.log(
+                    "train l1 penalty", l1_penalty, prog_bar=False, logger=True
+                )
+            else:
                 for layer in self.encoder.network:
                     if isinstance(layer, nn.Linear):
                         l1_norm = sum(p.abs().sum() for p in layer.parameters())
@@ -412,15 +421,6 @@ class MetricLearning(pl.LightningModule):
                             "train l1 penalty", l1_penalty, prog_bar=False, logger=True
                         )
                         break
-            else:
-                l1_norm = sum(
-                    p.abs().sum() for p in self.encoder.patch_embedding.parameters()
-                )
-                l1_penalty = self.l1 * l1_norm * current_lr
-                loss += l1_penalty
-                self.log(
-                    "train l1 penalty", l1_penalty, prog_bar=False, logger=True
-                )
 
         # if self.l2 > 0:  # use l2 penalty
         #    l2_regularization = []
