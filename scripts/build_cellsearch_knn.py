@@ -2,8 +2,8 @@ import argparse
 import os
 
 import tiledb
-import tiledb.vector_search as vs
-from tiledb.vector_search import _tiledbvspy as vspy
+
+from scimilarity.knn_backends import KNN_BACKENDS
 
 cfg = tiledb.Config()
 cfg["sm.mem.total_budget"] = 50000000000  # 50G
@@ -35,31 +35,26 @@ def main():
 
     # build knn
     knn_fullpath = os.path.join(cellsearch_path, knn_filename)
-    if knn_type == "hnswlib":
-        # build knn
-        n_cells, n_dims = embeddings.shape
-        knn = hnswlib.Index(space="cosine", dim=n_dims)
-        knn.init_index(max_elements=n_cells, ef_construction=ef_construction, M=M)
-        knn.set_ef(ef_construction)
-        knn.add_items(embeddings, range(len(embeddings)))
-        knn.save_index(os.path.join(cellsearch_path, knn_filename))
-    elif knn_type == "tiledb_vector_search":
-        knn = vs.ingest(
-            index_type="IVF_FLAT",
-            index_uri=os.path.join(cellsearch_path, knn_filename),
-            input_vectors=embeddings,
-            distance_metric=vspy.DistanceMetric.COSINE,
-            normalized=True,
-            filters=tiledb.FilterList([tiledb.LZ4Filter()])
-        )
-        knn.vacuum()
 
-        print("Vector array URI:", knn.db_uri, "\n")
-        A = tiledb.open(knn.db_uri)
-        print("Vector array schema:\n")
-        print(A.schema)
-        print(A.nonempty_domain())
-        A.close()
-    
+    if knn_type not in KNN_BACKENDS:
+        raise ValueError(
+            f"Unknown knn_type {knn_type!r}. "
+            f"Available backends: {sorted(KNN_BACKENDS)}"
+        )
+
+    backend_cls = KNN_BACKENDS[knn_type]
+    backend = backend_cls()
+
+    if knn_type == "hnswlib":
+        backend.build(
+            embeddings,
+            ef_construction=ef_construction,
+            M=M,
+        )
+        backend.save(knn_fullpath)
+    elif knn_type == "tiledb_vector_search":
+        backend.build(embeddings, index_uri=knn_fullpath)
+        print("TileDB index built at:", knn_fullpath)
+
 if __name__ == "__main__":
     main()

@@ -1,6 +1,7 @@
 from typing import Tuple, TYPE_CHECKING
 
 from .cell_embedding import CellEmbedding
+from .knn_backends import KNN_BACKENDS
 
 if TYPE_CHECKING:
     import numpy
@@ -34,11 +35,29 @@ class CellSearchKNN(CellEmbedding):
             use_gpu=use_gpu,
         )
 
-        self.knn = None
+        if knn_type not in KNN_BACKENDS:
+            raise ValueError(
+                f"Unknown knn_type {knn_type!r}. "
+                f"Available backends: {sorted(KNN_BACKENDS)}"
+            )
+
         self.knn_type = knn_type
-        assert self.knn_type in ["hnswlib", "tiledb_vector_search"]
+        self._backend = None
+        self.knn = None
         self.safelist = None
         self.blocklist = None
+
+    def _get_backend(self):
+        """Lazily instantiate and return the kNN backend."""
+        if self._backend is None:
+            backend_cls = KNN_BACKENDS[self.knn_type]
+            if self.knn_type == "hnswlib":
+                self._backend = backend_cls(
+                    space="cosine", dim=self.model.latent_dim
+                )
+            else:
+                self._backend = backend_cls()
+        return self._backend
 
     def load_knn_index(self, knn_file: str, memory_budget: int = 50000000):
         """Load the kNN index file
@@ -51,15 +70,18 @@ class CellSearchKNN(CellEmbedding):
             Memory budget for tiledb vector search.
         """
 
-        import hnswlib
         import os
-        import tiledb.vector_search as vs
 
-        if os.path.isfile(knn_file) and self.knn_type == "hnswlib":
-            self.knn = hnswlib.Index(space="cosine", dim=self.model.latent_dim)
-            self.knn.load_index(knn_file)
-        elif os.path.isdir(knn_file) and self.knn_type == "tiledb_vector_search":
-            self.knn = vs.IVFFlatIndex(knn_file, memory_budget=memory_budget)
+        backend = self._get_backend()
+
+        if self.knn_type == "hnswlib" and os.path.isfile(knn_file):
+            backend.load(knn_file)
+            self.knn = backend
+        elif self.knn_type == "tiledb_vector_search" and os.path.isdir(knn_file):
+            if hasattr(backend, "memory_budget"):
+                backend.memory_budget = memory_budget
+            backend.load(knn_file)
+            self.knn = backend
         else:
             print(f"Warning: No KNN index found at {knn_file}")
             self.knn = None
@@ -94,13 +116,4 @@ class CellSearchKNN(CellEmbedding):
 
         if self.knn is None:
             raise RuntimeError("kNN is not initialized.")
-        if self.knn_type == "hnswlib":
-            self.knn.set_ef(ef)
-            return self.knn.knn_query(embeddings, k=k)
-        elif self.knn_type == "tiledb_vector_search":
-            import math
-
-            nn_dists, nn_idxs = self.knn.query(
-                embeddings, k=k, nprobe=int(math.sqrt(self.knn.partitions))
-            )
-            return (nn_idxs, nn_dists)
+        return self.knn.query(embeddings, k=k, ef=ef)
