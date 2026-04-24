@@ -90,7 +90,7 @@ class MetricLearning(pl.LightningModule):
         cosine_annealing_tmax: Optional[int] = None,
         track_triplets: Optional[str] = None,
         track_triplets_above_step: int = -1,
-        architecture: str = "transformer_moe",
+        architecture: str = "mlp",
         d_model: int = 256,
         n_heads: int = 8,
         n_layers: int = 4,

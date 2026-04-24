@@ -38,7 +38,11 @@ class SimpleDist(nn.Module):
         """
 
         f_anc = self.encoder(anchors)
+        if isinstance(f_anc, tuple):
+            f_anc = f_anc[0]
         f_neg = self.encoder(negatives)
+        if isinstance(f_neg, tuple):
+            f_neg = f_neg[0]
         return ((f_neg - f_anc) ** 2).sum(dim=1)
 
 
